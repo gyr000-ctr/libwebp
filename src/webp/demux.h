@@ -351,6 +351,55 @@ WEBP_NODISCARD WEBP_EXTERN int WebPAnimDecoderHasMoreFrames(
 //   dec - (in/out) decoder instance to be reset
 WEBP_EXTERN void WebPAnimDecoderReset(WebPAnimDecoder* dec);
 
+// Status codes returned by WebPAnimDecoderSeek().
+typedef enum WebPAnimSeekStatus {
+  WEBP_ANIM_SEEK_OK = 0,            // Seek succeeded, target frame is a
+                                    // key-frame and is the next frame to be
+                                    // returned by WebPAnimDecoderGetNext().
+  WEBP_ANIM_SEEK_NON_KEY_FRAME = 1, // Target frame is not independently
+                                    // decodable. Decoding was restarted from
+                                    // the nearest preceding key-frame and the
+                                    // target was reached by sequential decode;
+                                    // the next WebPAnimDecoderGetNext() call
+                                    // still returns the requested frame.
+  WEBP_ANIM_SEEK_INVALID_FRAME = 2, // 'frame_num' is out of range (smaller
+                                    // than 1 or larger than frame_count).
+  WEBP_ANIM_SEEK_CORRUPT_FRAME = 3  // A frame could not be decoded while
+                                    // positioning the decoder. The decoder has
+                                    // been reset to its initial state; call
+                                    // WebPAnimDecoderGetNext() to restart from
+                                    // the first frame.
+} WebPAnimSeekStatus;
+
+// Positions the decoder so that the next call to WebPAnimDecoderGetNext()
+// returns frame 'frame_num' (frames are 1-based, as in WebPDemuxGetFrame()).
+// If 'frame_num' does not reference a key-frame, the decoder cannot start
+// decoding there directly: it restarts at the nearest preceding key-frame and
+// sequentially decodes the frames in between up to the requested one, which is
+// then returned by the next WebPAnimDecoderGetNext() call. This keeps the
+// rendering chain (blending and disposal) and the reported timestamps correct.
+// WEBP_ANIM_SEEK_NON_KEY_FRAME is returned to signal that the fallback
+// occurred, even though the requested frame is still delivered.
+// After this call the previously returned output buffer must be considered
+// invalid, exactly as after WebPAnimDecoderReset().
+// The operation keeps memory bounded independently of the frame count and of
+// 'frame_num': besides the existing decoder canvases it uses at most one
+// additional canvas-sized buffer (the frame returned by the next
+// WebPAnimDecoderGetNext() call), never a per-frame cache.
+// Parameters:
+//   dec - (in/out) decoder instance to be repositioned.
+//   frame_num - (in) 1-based index of the desired frame.
+// Returns:
+//   WEBP_ANIM_SEEK_OK on success,
+//   WEBP_ANIM_SEEK_NON_KEY_FRAME if a fallback to an earlier key-frame
+//   occurred,
+//   WEBP_ANIM_SEEK_INVALID_FRAME if 'dec' is NULL or 'frame_num' is out of
+//   range (the decoder state is left unchanged in that case),
+//   WEBP_ANIM_SEEK_CORRUPT_FRAME if decoding failed while seeking (the decoder
+//   is then reset to its initial state).
+WEBP_NODISCARD WEBP_EXTERN WebPAnimSeekStatus WebPAnimDecoderSeek(
+    WebPAnimDecoder* dec, int frame_num);
+
 // Grab the internal demuxer object.
 // Getting the demuxer object can be useful if one wants to use operations only
 // available through demuxer; e.g. to get XMP/EXIF/ICC metadata. The returned

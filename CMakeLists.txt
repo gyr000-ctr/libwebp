@@ -804,6 +804,17 @@ if(WEBP_BUILD_FUZZTEST)
   add_subdirectory(tests/fuzzer)
 endif()
 
+# Unit tests run through ctest.
+if(WEBP_BUILD_LIBWEBPMUX)
+  enable_testing()
+  add_executable(anim_seek tests/anim_seek.c)
+  target_link_libraries(anim_seek PRIVATE webp webpdemux libwebpmux)
+  target_include_directories(
+    anim_seek PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                      ${CMAKE_CURRENT_BINARY_DIR}/src)
+  add_test(NAME anim_seek COMMAND anim_seek)
+endif()
+
 # Install the different headers and libraries.
 install(
   TARGETS ${INSTALLED_LIBRARIES}

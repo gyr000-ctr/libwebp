@@ -51,6 +51,13 @@ struct WebPAnimDecoder {
   WebPAnimInfo info;             // Global info about the animation.
   uint8_t* curr_frame;           // Current canvas (not disposed).
   uint8_t* prev_frame_disposed;  // Previous canvas (properly disposed).
+  uint8_t* cached_frame;         // Frame produced by WebPAnimDecoderSeek() and
+                                 // not yet returned by GetNext(). Its size is
+                                 // bounded by the canvas size, independently
+                                 // of the frame count.
+  int has_cached_frame;          // Whether 'cached_frame' holds a pending
+                                 // frame.
+  int cached_timestamp;          // Timestamp of 'cached_frame'.
   int prev_frame_timestamp;      // Previous frame timestamp (milliseconds).
   WebPIterator prev_iter;        // Iterator object for previous frame.
   int prev_frame_was_keyframe;   // True if previous frame was a keyframe.
@@ -147,6 +154,9 @@ WebPAnimDecoder* WebPAnimDecoderNewInternal(
   dec->prev_frame_disposed = (uint8_t*)WebPSafeCalloc(
       dec->info.canvas_width * NUM_CHANNELS, dec->info.canvas_height);
   if (dec->prev_frame_disposed == NULL) goto Error;
+  dec->cached_frame = (uint8_t*)WebPSafeCalloc(
+      dec->info.canvas_width * NUM_CHANNELS, dec->info.canvas_height);
+  if (dec->cached_frame == NULL) goto Error;
 
   WebPAnimDecoderReset(dec);
   return dec;
@@ -355,8 +365,12 @@ static void FindBlendRangeAtRow(const WebPIterator* const src,
   }
 }
 
-int WebPAnimDecoderGetNext(WebPAnimDecoder* dec, uint8_t** buf_ptr,
-                           int* timestamp_ptr) {
+// Decodes the next frame (dec->next_frame) into 'dec->curr_frame' and advances
+// the decoder state. Shared by the sequential and the seek code paths so that
+// both produce bit-identical frames and timestamps.
+WEBP_NODISCARD static int DecodeNextFrame(WebPAnimDecoder* dec,
+                                          uint8_t** buf_ptr,
+                                          int* timestamp_ptr) {
   WebPIterator iter;
   uint32_t width;
   uint32_t height;
@@ -364,8 +378,11 @@ int WebPAnimDecoderGetNext(WebPAnimDecoder* dec, uint8_t** buf_ptr,
   int timestamp;
   BlendRowFunc blend_row;
 
-  if (dec == NULL || buf_ptr == NULL || timestamp_ptr == NULL) return 0;
-  if (!WebPAnimDecoderHasMoreFrames(dec)) return 0;
+  if (dec == NULL) return 0;
+  // Note: do not use WebPAnimDecoderHasMoreFrames() here: during a seek the
+  // pending-frame cache is not marked active until the requested frame has
+  // been decoded, while decoding still has to proceed up to that point.
+  if (dec->next_frame > (int)dec->info.frame_count) return 0;
 
   width = dec->info.canvas_width;
   height = dec->info.canvas_height;
@@ -471,11 +488,27 @@ int WebPAnimDecoderGetNext(WebPAnimDecoder* dec, uint8_t** buf_ptr,
   WebPDemuxReleaseIterator(&dec->prev_iter);
   dec->prev_iter = iter;
   dec->prev_frame_was_keyframe = is_key_frame;
+  // Snapshot the rendered canvas before applying the disposal of the frame
+  // just decoded, so that blending of the next frame is done against the
+  // properly disposed previous canvas.
+  {
+    const uint64_t canvas_size =
+        (uint64_t)width * height * NUM_CHANNELS;
+    if (!CheckSizeOverflow(canvas_size)) {
+      WEBP_UNSAFE_MEMCPY(dec->prev_frame_disposed, dec->curr_frame,
+                         (size_t)canvas_size);
+      if (dec->prev_iter.dispose_method == WEBP_MUX_DISPOSE_BACKGROUND) {
+        ZeroFillFrameRect(dec->prev_frame_disposed, width * NUM_CHANNELS,
+                          dec->prev_iter.x_offset, dec->prev_iter.y_offset,
+                          dec->prev_iter.width, dec->prev_iter.height);
+      }
+    }
+  }
   ++dec->next_frame;
 
   // All OK, fill in the values.
-  *buf_ptr = dec->curr_frame;
-  *timestamp_ptr = timestamp;
+  if (buf_ptr != NULL) *buf_ptr = dec->curr_frame;
+  if (timestamp_ptr != NULL) *timestamp_ptr = timestamp;
   return 1;
 
 Error:
@@ -483,19 +516,177 @@ Error:
   return 0;
 }
 
+int WebPAnimDecoderGetNext(WebPAnimDecoder* dec, uint8_t** buf_ptr,
+                           int* timestamp_ptr) {
+  if (dec == NULL || buf_ptr == NULL || timestamp_ptr == NULL) return 0;
+  // A frame previously materialized by WebPAnimDecoderSeek() is returned
+  // first, so a seek followed by GetNext() behaves exactly like sequential
+  // decoding.
+  if (dec->has_cached_frame) {
+    *buf_ptr = dec->cached_frame;
+    *timestamp_ptr = dec->cached_timestamp;
+    dec->has_cached_frame = 0;
+    return 1;
+  }
+  if (!WebPAnimDecoderHasMoreFrames(dec)) return 0;
+  return DecodeNextFrame(dec, buf_ptr, timestamp_ptr);
+}
+
 int WebPAnimDecoderHasMoreFrames(const WebPAnimDecoder* dec) {
   if (dec == NULL) return 0;
+  if (dec->has_cached_frame) return 1;
   return (dec->next_frame <= (int)dec->info.frame_count);
 }
 
+// Reset the decoder state to the beginning of the animation, zeroing the
+// canvases so that decoding restarts from a transparent background. Used both
+// by WebPAnimDecoderReset() and by the seek machinery after a decode failure.
+static void ResetDecoderState(WebPAnimDecoder* const dec) {
+  const uint64_t canvas_size =
+      (uint64_t)dec->info.canvas_width * dec->info.canvas_height *
+      NUM_CHANNELS;
+  dec->prev_frame_timestamp = 0;
+  WebPDemuxReleaseIterator(&dec->prev_iter);
+  WEBP_UNSAFE_MEMSET(&dec->prev_iter, 0, sizeof(dec->prev_iter));
+  dec->prev_frame_was_keyframe = 0;
+  dec->next_frame = 1;
+  dec->dirty_x = 0;
+  dec->dirty_y = 0;
+  dec->dirty_width = 0;
+  dec->dirty_height = 0;
+  dec->has_cached_frame = 0;
+  dec->cached_timestamp = 0;
+  if (!CheckSizeOverflow(canvas_size)) return;
+  WEBP_UNSAFE_MEMSET(dec->curr_frame, 0, (size_t)canvas_size);
+  WEBP_UNSAFE_MEMSET(dec->prev_frame_disposed, 0, (size_t)canvas_size);
+  WEBP_UNSAFE_MEMSET(dec->cached_frame, 0, (size_t)canvas_size);
+}
+
 void WebPAnimDecoderReset(WebPAnimDecoder* dec) {
-  if (dec != NULL) {
-    dec->prev_frame_timestamp = 0;
-    WebPDemuxReleaseIterator(&dec->prev_iter);
-    WEBP_UNSAFE_MEMSET(&dec->prev_iter, 0, sizeof(dec->prev_iter));
-    dec->prev_frame_was_keyframe = 0;
-    dec->next_frame = 1;
+  if (dec != NULL) ResetDecoderState(dec);
+}
+
+// Subset of frame metadata needed to classify key-frames. Copied out of the
+// demux iterator because the classification needs the previous frame's data
+// while a new iterator is being fetched.
+typedef struct {
+  int width;
+  int height;
+  int has_alpha;
+  WebPMuxAnimDispose dispose_method;
+  WebPMuxAnimBlend blend_method;
+} FrameMeta;
+
+// Same classification as IsKeyFrame(), operating on plain frame metadata so
+// that it can be applied without holding a demux iterator.
+static int IsKeyFrameMeta(const FrameMeta* const curr,
+                          const FrameMeta* const prev,
+                          int prev_frame_was_key_frame, int canvas_width,
+                          int canvas_height) {
+  if ((!curr->has_alpha || curr->blend_method == WEBP_MUX_NO_BLEND) &&
+      IsFullFrame(curr->width, curr->height, canvas_width, canvas_height)) {
+    return 1;
   }
+  return (prev->dispose_method == WEBP_MUX_DISPOSE_BACKGROUND) &&
+         (IsFullFrame(prev->width, prev->height, canvas_width,
+                      canvas_height) ||
+          prev_frame_was_key_frame);
+}
+
+// Finds the largest frame index (1-based) not greater than 'target' that can
+// be used as the starting point of decoding, i.e. a key-frame in the sense of
+// IsKeyFrame(). Frame 1 always qualifies, so the returned value is at least 1.
+// Only container metadata is inspected: no pixel decoding happens here and the
+// memory used is bounded by one stack-allocated iterator and two FrameMeta
+// objects, regardless of the frame count.
+// Returns 0 if the bitstream metadata cannot be read.
+static int FindKeyFrameAnchor(const WebPAnimDecoder* const dec, int target) {
+  const uint32_t width = dec->info.canvas_width;
+  const uint32_t height = dec->info.canvas_height;
+  WebPIterator iter;
+  FrameMeta prev_meta;
+  FrameMeta curr_meta;
+  int prev_frame_was_key_frame = 1;  // frame 1 is always a key-frame.
+  int anchor = 1;
+  int frame_num;
+
+  if (!WebPDemuxGetFrame(dec->demux, 1, &iter)) return 0;
+  prev_meta.width = iter.width;
+  prev_meta.height = iter.height;
+  prev_meta.has_alpha = iter.has_alpha;
+  prev_meta.dispose_method = iter.dispose_method;
+  prev_meta.blend_method = iter.blend_method;
+
+  for (frame_num = 2; frame_num <= target; ++frame_num) {
+    int is_key_frame;
+    if (!WebPDemuxGetFrame(dec->demux, frame_num, &iter)) {
+      WebPDemuxReleaseIterator(&iter);
+      return 0;
+    }
+    curr_meta.width = iter.width;
+    curr_meta.height = iter.height;
+    curr_meta.has_alpha = iter.has_alpha;
+    curr_meta.dispose_method = iter.dispose_method;
+    curr_meta.blend_method = iter.blend_method;
+
+    is_key_frame = IsKeyFrameMeta(&curr_meta, &prev_meta,
+                                  prev_frame_was_key_frame, width, height);
+    if (is_key_frame) anchor = frame_num;
+    prev_frame_was_key_frame = is_key_frame;
+    prev_meta = curr_meta;
+  }
+  WebPDemuxReleaseIterator(&iter);
+  return anchor;
+}
+
+WebPAnimSeekStatus WebPAnimDecoderSeek(WebPAnimDecoder* dec, int frame_num) {
+  int anchor;
+  if (dec == NULL) return WEBP_ANIM_SEEK_INVALID_FRAME;
+  if (frame_num < 1 || frame_num > (int)dec->info.frame_count) {
+    return WEBP_ANIM_SEEK_INVALID_FRAME;
+  }
+
+  anchor = FindKeyFrameAnchor(dec, frame_num);
+  if (anchor == 0) {
+    // Unreadable frame metadata: treat like a corrupt bitstream and leave the
+    // decoder in a clean, usable state.
+    ResetDecoderState(dec);
+    return WEBP_ANIM_SEEK_CORRUPT_FRAME;
+  }
+
+  // Restart from a transparent canvas and decode through the requested frame
+  // using the regular sequential path; this keeps all pointer provenance on
+  // the originally allocated canvases.
+  ResetDecoderState(dec);
+  while (dec->next_frame <= frame_num) {
+    int timestamp;
+    if (!DecodeNextFrame(dec, NULL, &timestamp)) {
+      ResetDecoderState(dec);
+      return WEBP_ANIM_SEEK_CORRUPT_FRAME;
+    }
+    if (dec->next_frame == frame_num + 1) {
+      dec->cached_timestamp = timestamp;
+    }
+  }
+
+  // Snapshot the requested frame into the single-entry cache so it survives
+  // untouched until the next WebPAnimDecoderGetNext() call. The working
+  // canvas ('curr_frame') already holds the same state, so decoding of
+  // subsequent frames continues correctly after the cache is consumed.
+  {
+    const uint64_t canvas_size =
+        (uint64_t)dec->info.canvas_width * dec->info.canvas_height *
+        NUM_CHANNELS;
+    if (!CheckSizeOverflow(canvas_size)) {
+      ResetDecoderState(dec);
+      return WEBP_ANIM_SEEK_CORRUPT_FRAME;
+    }
+    WEBP_UNSAFE_MEMCPY(dec->cached_frame, dec->curr_frame,
+                       (size_t)canvas_size);
+  }
+  dec->has_cached_frame = 1;
+  return (anchor == frame_num) ? WEBP_ANIM_SEEK_OK
+                               : WEBP_ANIM_SEEK_NON_KEY_FRAME;
 }
 
 const WebPDemuxer* WebPAnimDecoderGetDemuxer(const WebPAnimDecoder* dec) {
@@ -509,6 +700,7 @@ void WebPAnimDecoderDelete(WebPAnimDecoder* dec) {
     WebPDemuxDelete(dec->demux);
     WebPSafeFree(dec->curr_frame);
     WebPSafeFree(dec->prev_frame_disposed);
+    WebPSafeFree(dec->cached_frame);
     WebPSafeFree(dec);
   }
 }
