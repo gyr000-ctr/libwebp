@@ -266,7 +266,11 @@ typedef enum WEBP_NODISCARD VP8StatusCode {
   VP8_STATUS_UNSUPPORTED_FEATURE,
   VP8_STATUS_SUSPENDED,
   VP8_STATUS_USER_ABORT,
-  VP8_STATUS_NOT_ENOUGH_DATA
+  VP8_STATUS_NOT_ENOUGH_DATA,
+  // Errors specific to the 'rotation' decoding option (WebPDecode() only).
+  VP8_STATUS_INVALID_ROTATION,  // rotation angle is not 0/90/180/270
+  VP8_STATUS_ROTATION_CROP_CONFLICT,  // crop window outside the rotated frame
+  VP8_STATUS_IMAGE_TOO_LARGE  // rotated output would exceed the size limit
 } VP8StatusCode;
 
 //------------------------------------------------------------------------------
@@ -485,17 +489,29 @@ struct WebPDecoderOptions {
   int use_cropping;                 // if true, cropping is applied _first_
   int crop_left, crop_top;          // top-left position for cropping.
                                     // Will be snapped to even values.
+                                    // If 'rotation' is non-zero, these are
+                                    // expressed in the _rotated_ frame instead.
   int crop_width, crop_height;      // dimension of the cropping area
   int use_scaling;                  // if true, scaling is applied _afterward_
   int scaled_width, scaled_height;  // final resolution. if one is 0, it is
                                     // guessed from the other one to keep the
-                                    // original ratio.
+                                    // original ratio. If 'rotation' is
+                                    // non-zero, these are expressed in the
+                                    // _rotated_ frame instead.
   int use_threads;                  // if true, use multi-threaded decoding
   int dithering_strength;           // dithering strength (0=Off, 100=full)
-  int flip;                         // if true, flip output vertically
+  int flip;                         // if true, flip output vertically (after
+                                    // the rotation, if any)
   int alpha_dithering_strength;     // alpha dithering strength in [0..100]
+  int rotation;                     // if non-zero, rotate the output by this
+                                    // many degrees clockwise. Must be 90, 180
+                                    // or 270. Cropping and scaling parameters
+                                    // are then expressed in the rotated
+                                    // (output) frame and 'flip' is applied
+                                    // after the rotation. Only honored by
+                                    // WebPDecode(), not the incremental API.
 
-  uint32_t pad[5];  // padding for later use
+  uint32_t pad[4];  // padding for later use
 };
 
 // Main object storing the configuration for advanced decoding.

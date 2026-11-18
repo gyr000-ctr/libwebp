@@ -42,6 +42,7 @@ option(WEBP_BUILD_WEBPMUX "Build the webpmux command line tool." ON)
 option(WEBP_BUILD_EXTRAS "Build extras." ON)
 option(WEBP_BUILD_WEBP_JS "Emscripten build of webp.js." OFF)
 option(WEBP_BUILD_FUZZTEST "Build the fuzztest tests." OFF)
+option(WEBP_BUILD_TESTS "Build the tests." ON)
 option(WEBP_USE_THREAD "Enable threading support" ON)
 option(WEBP_NEAR_LOSSLESS "Enable near-lossless encoding" ON)
 option(WEBP_ENABLE_SWAP_16BIT_CSP "Enable byte swap for 16 bit colorspaces."
@@ -802,6 +803,13 @@ endif()
 
 if(WEBP_BUILD_FUZZTEST)
   add_subdirectory(tests/fuzzer)
+endif()
+
+if(WEBP_BUILD_TESTS)
+  enable_testing()
+  add_executable(rotate90_test tests/rotate90_test.c)
+  target_link_libraries(rotate90_test PRIVATE webp)
+  add_test(NAME rotate90 COMMAND rotate90_test)
 endif()
 
 # Install the different headers and libraries.

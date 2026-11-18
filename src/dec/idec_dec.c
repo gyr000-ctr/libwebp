@@ -746,6 +746,9 @@ WebPIDecoder* WebPIDecode(const uint8_t* WEBP_COUNTED_BY(data_size) data,
       return NULL;
     }
   }
+  if (config != NULL && config->options.rotation != 0) {
+    return NULL;  // 'rotation' is only supported by WebPDecode().
+  }
 
   // Create an instance of the incremental decoder
   idec = (config != NULL) ? NewDecoder(&config->output, features)

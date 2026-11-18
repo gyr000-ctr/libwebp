@@ -801,6 +801,12 @@ int WebPValidateDecoderConfig(const WebPDecoderConfig* config) {
   // bypass_filtering, no_fancy_upsampling, use_cropping, use_scaling,
   // use_threads, flip can be any integer and are interpreted as boolean.
 
+  // Check for rotation.
+  if (options->rotation != 0 && options->rotation != 90 &&
+      options->rotation != 180 && options->rotation != 270) {
+    return 0;
+  }
+
   // Check for cropping.
   if (options->use_cropping && !WebPCheckCropDimensionsBasic(
                                    options->crop_left, options->crop_top,
@@ -820,6 +826,12 @@ int WebPValidateDecoderConfig(const WebPDecoderConfig* config) {
     int height = config->input.height;
     int scaled_width = options->scaled_width;
     int scaled_height = options->scaled_height;
+    if (options->rotation == 90 || options->rotation == 270) {
+      // Cropping and scaling are expressed in the rotated frame.
+      const int tmp = width;
+      width = height;
+      height = tmp;
+    }
     if (options->use_cropping) {
       if (!WebPCheckCropDimensions(width, height, options->crop_left,
                                    options->crop_top, options->crop_width,
@@ -860,6 +872,229 @@ VP8StatusCode WebPGetFeaturesInternal(const uint8_t* WEBP_COUNTED_BY(data_size)
   return GetFeatures(data, data_size, features);
 }
 
+//------------------------------------------------------------------------------
+// Output rotation (WebPDecoderOptions::rotation, WebPDecode() only).
+//
+// The rotation is applied to the final output: cropping and scaling
+// parameters are expressed in the rotated (output) frame and 'flip' is
+// applied after the rotation. The picture is decoded into a temporary
+// buffer (with the crop/scale parameters mapped back to the source frame)
+// and then rotated into the user's output buffer.
+
+// Upper bound on the number of pixels in the rotated output. Rotation needs
+// a temporary full-size copy of the decoded picture, so larger outputs are
+// rejected upfront with VP8_STATUS_IMAGE_TOO_LARGE, before any allocation.
+#define MAX_ROTATED_PIXELS ((uint64_t)1 << 28)
+
+// Rotates the 'w' x 'h' plane of 'bpp'-byte pixels from 'src' into 'dst' by
+// 'rotation' degrees clockwise. 'dst' must have room for 'w' x 'h' pixels
+// (i.e. swapped dimensions for 90/270 degrees).
+static void RotatePlane(const uint8_t* const src, int src_stride,
+                        uint8_t* const dst, int dst_stride, int w, int h,
+                        int bpp, int rotation) {
+  int x, y;
+  if (rotation == 180) {
+    for (y = 0; y < h; ++y) {
+      const uint8_t* const src_row = src + (h - 1 - y) * (int64_t)src_stride;
+      uint8_t* const dst_row = dst + y * (int64_t)dst_stride;
+      for (x = 0; x < w; ++x) {
+        memcpy(dst_row + x * bpp, src_row + (w - 1 - x) * bpp, bpp);
+      }
+    }
+  } else if (rotation == 90) {
+    // dst(x, y) = src(y, h - 1 - x); 'dst' is 'h' wide and 'w' tall.
+    for (y = 0; y < w; ++y) {
+      const uint8_t* const src_col = src + y * bpp;
+      uint8_t* const dst_row = dst + y * (int64_t)dst_stride;
+      for (x = 0; x < h; ++x) {
+        memcpy(dst_row + x * bpp,
+               src_col + (h - 1 - x) * (int64_t)src_stride, bpp);
+      }
+    }
+  } else {  // rotation == 270
+    // dst(x, y) = src(w - 1 - y, x); 'dst' is 'h' wide and 'w' tall.
+    for (y = 0; y < w; ++y) {
+      const uint8_t* const src_col = src + (w - 1 - y) * bpp;
+      uint8_t* const dst_row = dst + y * (int64_t)dst_stride;
+      for (x = 0; x < h; ++x) {
+        memcpy(dst_row + x * bpp, src_col + x * (int64_t)src_stride, bpp);
+      }
+    }
+  }
+}
+
+// Rotates the decoded picture 'src' into 'dst', applying 'flip' (vertical
+// flip of the final output) on the fly. 'dst' must already be set up with
+// the rotated dimensions.
+static void RotateBuffer(const WebPDecBuffer* const src,
+                         WebPDecBuffer* const dst, int rotation, int flip) {
+  const int w = src->width;
+  const int h = src->height;
+  if (WebPIsRGBMode(src->colorspace)) {
+    // Bytes per pixel for the RGB modes: 3 for MODE_RGB/BGR, 2 for
+    // MODE_RGBA_4444/RGB_565, 4 otherwise.
+    const int bpp = (src->colorspace == MODE_RGB || src->colorspace == MODE_BGR)
+                        ? 3
+                        : (src->colorspace == MODE_RGBA_4444 ||
+                           src->colorspace == MODE_RGB_565)
+                              ? 2
+                              : 4;
+    uint8_t* dst_ptr = dst->u.RGBA.rgba;
+    int dst_stride = dst->u.RGBA.stride;
+    if (flip) {
+      dst_ptr += (dst->height - 1) * (int64_t)dst_stride;
+      dst_stride = -dst_stride;
+    }
+    RotatePlane(src->u.RGBA.rgba, src->u.RGBA.stride, dst_ptr, dst_stride, w, h,
+                bpp, rotation);
+  } else {
+    // YUV 4:2:0: rotate each plane independently. Note that for 90/270
+    // degrees and odd dimensions, the chroma siting is approximate.
+    const WebPYUVABuffer* const s = &src->u.YUVA;
+    const WebPYUVABuffer* const d = &dst->u.YUVA;
+    const int uv_w = (w + 1) / 2;
+    const int uv_h = (h + 1) / 2;
+    uint8_t* dst_y = d->y;
+    uint8_t* dst_u = d->u;
+    uint8_t* dst_v = d->v;
+    int y_stride = d->y_stride;
+    int u_stride = d->u_stride;
+    int v_stride = d->v_stride;
+    if (flip) {
+      dst_y += (dst->height - 1) * (int64_t)y_stride;
+      y_stride = -y_stride;
+      dst_u += ((dst->height + 1) / 2 - 1) * (int64_t)u_stride;
+      u_stride = -u_stride;
+      dst_v += ((dst->height + 1) / 2 - 1) * (int64_t)v_stride;
+      v_stride = -v_stride;
+    }
+    RotatePlane(s->y, s->y_stride, dst_y, y_stride, w, h, 1, rotation);
+    RotatePlane(s->u, s->u_stride, dst_u, u_stride, uv_w, uv_h, 1, rotation);
+    RotatePlane(s->v, s->v_stride, dst_v, v_stride, uv_w, uv_h, 1, rotation);
+    if (WebPIsAlphaMode(src->colorspace) && s->a != NULL && d->a != NULL) {
+      uint8_t* dst_a = d->a;
+      int a_stride = d->a_stride;
+      if (flip) {
+        dst_a += (dst->height - 1) * (int64_t)a_stride;
+        a_stride = -a_stride;
+      }
+      RotatePlane(s->a, s->a_stride, dst_a, a_stride, w, h, 1, rotation);
+    }
+  }
+}
+
+// Maps a crop window expressed in the rotated output frame back to the
+// source frame. 'src_width'/'src_height' are the bitstream dimensions.
+static void MapCropToSourceFrame(int rotation, int src_width, int src_height,
+                                 int* const x, int* const y, int* const w,
+                                 int* const h) {
+  const int cx = *x, cy = *y, cw = *w, ch = *h;
+  if (rotation == 90) {
+    *x = cy;
+    *y = src_height - cx - cw;
+    *w = ch;
+    *h = cw;
+  } else if (rotation == 180) {
+    *x = src_width - cx - cw;
+    *y = src_height - cy - ch;
+  } else {  // rotation == 270
+    *x = src_width - cy - ch;
+    *y = cx;
+    *w = ch;
+    *h = cw;
+  }
+}
+
+WEBP_NODISCARD static VP8StatusCode DecodeWithRotation(
+    const uint8_t* WEBP_COUNTED_BY(data_size) data, size_t data_size,
+    WebPDecoderConfig* const config) {
+  const WebPDecoderOptions* const options = &config->options;
+  const int rotation = options->rotation;
+  const int src_width = config->input.width;
+  const int src_height = config->input.height;
+  WebPDecoderConfig tmp_config;
+  WebPDecParams params;
+  VP8StatusCode status;
+  int out_width, out_height;
+  int final_width, final_height;
+
+  if (rotation != 90 && rotation != 180 && rotation != 270) {
+    return VP8_STATUS_INVALID_ROTATION;
+  }
+  // Dimensions of the rotated frame, before cropping / scaling.
+  out_width = (rotation == 180) ? src_width : src_height;
+  out_height = (rotation == 180) ? src_height : src_width;
+  if (options->use_cropping) {
+    // The crop window is expressed in the rotated frame.
+    if (!WebPCheckCropDimensions(out_width, out_height, options->crop_left,
+                                 options->crop_top, options->crop_width,
+                                 options->crop_height)) {
+      return VP8_STATUS_ROTATION_CROP_CONFLICT;
+    }
+    out_width = options->crop_width;
+    out_height = options->crop_height;
+  }
+  if (options->use_scaling) {
+    int scaled_width = options->scaled_width;
+    int scaled_height = options->scaled_height;
+    if (!WebPRescalerGetScaledDimensions(out_width, out_height, &scaled_width,
+                                         &scaled_height)) {
+      return VP8_STATUS_INVALID_PARAM;
+    }
+    out_width = scaled_width;
+    out_height = scaled_height;
+  }
+  if ((uint64_t)out_width * out_height > MAX_ROTATED_PIXELS) {
+    return VP8_STATUS_IMAGE_TOO_LARGE;
+  }
+
+  // Decode into a temporary buffer, with the crop/scale parameters mapped
+  // back to the source frame and the flip/rotation left to apply.
+  tmp_config = *config;
+  tmp_config.options.rotation = 0;
+  tmp_config.options.flip = 0;  // 'flip' is applied after the rotation.
+  if (options->use_cropping) {
+    MapCropToSourceFrame(rotation, src_width, src_height,
+                         &tmp_config.options.crop_left,
+                         &tmp_config.options.crop_top,
+                         &tmp_config.options.crop_width,
+                         &tmp_config.options.crop_height);
+  }
+  if (options->use_scaling && rotation != 180) {
+    // Scaling dimensions are expressed in the rotated frame.
+    const int tmp = tmp_config.options.scaled_width;
+    tmp_config.options.scaled_width = tmp_config.options.scaled_height;
+    tmp_config.options.scaled_height = tmp;
+  }
+  if (!WebPInitDecBuffer(&tmp_config.output)) {
+    return VP8_STATUS_INVALID_PARAM;
+  }
+  tmp_config.output.colorspace = config->output.colorspace;
+
+  WebPResetDecParams(&params);
+  params.options = &tmp_config.options;
+  params.output = &tmp_config.output;
+  status = DecodeInto(data, data_size, &params);
+  if (status != VP8_STATUS_OK) {
+    return status;  // 'tmp_config.output' was already freed by DecodeInto().
+  }
+
+  // Allocate (or validate, for external memory) the final output buffer
+  // with the rotated dimensions, and rotate the picture into it.
+  final_width = (rotation == 180) ? tmp_config.output.width
+                                  : tmp_config.output.height;
+  final_height = (rotation == 180) ? tmp_config.output.height
+                                   : tmp_config.output.width;
+  status = WebPAllocateDecBuffer(final_width, final_height, NULL,
+                                 &config->output);
+  if (status == VP8_STATUS_OK) {
+    RotateBuffer(&tmp_config.output, &config->output, rotation,
+                 options->flip);
+  }
+  WebPFreeDecBuffer(&tmp_config.output);
+  return status;
+}
+
 VP8StatusCode WebPDecode(const uint8_t* WEBP_COUNTED_BY(data_size) data,
                          size_t data_size, WebPDecoderConfig* config) {
   WebPDecParams params;
@@ -875,6 +1110,10 @@ VP8StatusCode WebPDecode(const uint8_t* WEBP_COUNTED_BY(data_size) data,
       return VP8_STATUS_BITSTREAM_ERROR;  // Not-enough-data treated as error.
     }
     return status;
+  }
+
+  if (config->options.rotation != 0) {
+    return DecodeWithRotation(data, data_size, config);
   }
 
   WebPResetDecParams(&params);
